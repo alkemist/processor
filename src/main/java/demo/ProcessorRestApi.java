@@ -9,7 +9,6 @@ import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.Point;
 import org.springframework.stereotype.Component;
 import ratpack.exec.Promise;
-import ratpack.func.Action;
 import ratpack.handling.Context;
 import ratpack.handling.Handler;
 import reactor.core.Environment;
@@ -56,77 +55,73 @@ public class ProcessorRestApi {
 		this.defaultDistance = new Distance(config.getDefaultDistance());
 	}
 
+
 	public Handler createLocation() {
 		return ctx -> {
 			// Save a new Location
-			Location location = ctx.parse(fromJson(Location.class));
-			ctx.blocking(() -> locations.save(location)).then(loc -> {
-				// Broadcast to others
-				locationEventStream.broadcastNext(loc);
+			final Location loc = ctx.parse(fromJson(Location.class));
+			ctx.blocking(() -> locations.save(loc))
+					.flatMap(ignore -> {
+						// Broadcast to others
+						locationEventStream.broadcastNext(loc);
+						return ctx.blocking(() -> (List<Location>) locations.findAll());
+					})
+					.then(prev -> {
+						// Only add Locations <= 10km away from my Location
+						Point p = new Point(loc.getCoordinates()[0], loc.getCoordinates()[1]);
+						GeoNearPredicate filter = new GeoNearPredicate(p, defaultDistance);
 
-				// Only add Locations <= 10km away from my Location
-				Point p = new Point(loc.getCoordinates()[0], loc.getCoordinates()[1]);
-				GeoNearPredicate filter = new GeoNearPredicate(p, defaultDistance);
+						Stream<Location> sink;
+						if (prev.isEmpty()) {
+							sink = locationEventStream;
+						} else {
+							sink = Streams.merge(env, locationEventStream, Streams.defer(prev));
+						}
+						sink
+								.filter(l -> !nullSafeEquals(loc.getId(), l.getId())) // not us
+								.filter(filter)
+								.consume(loc2 -> geoNear.addGeoNear(loc, loc2)); // add to cache
 
-				ctx.blocking(() -> (List<Location>) locations.findAll()).then(prev -> {
-					Stream<Location> sink;
-					if (prev.isEmpty()) {
-						sink = locationEventStream;
-					} else {
-						sink = Streams.merge(env, locationEventStream, Streams.defer(prev));
-					}
-					sink
-							.filter(l -> !nullSafeEquals(loc.getId(), l.getId())) // not us
-							.filter(filter)
-							.consume(loc2 -> geoNear.addGeoNear(loc, loc2)); // add to cache
+						// Listen for changes to distance value
+						eventBus.on($(loc.getId() + ".distance"), filter);
 
-					// Listen for changes to distance value
-					eventBus.on($(loc.getId() + ".distance"), filter);
-
-					// Redirect to REST URL
-					ctx.redirect(303, config.getBaseUri() + "/location/" + loc.getId());
-				});
-			});
-
+						// Redirect to REST URL
+						ctx.redirect(303, config.getBaseUri() + "/location/" + loc.getId());
+					});
 		};
 	}
 
 	public Handler updateLocation() {
-		return ctx -> findLocation(ctx).then(loc -> {
-			if (loc == null) {
-				ctx.clientError(404);
-				return;
-			}
+		return ctx -> findLocation(ctx)
+				.flatMap(loc -> {
+					// Update Location
+					Location inLoc = ctx.parse(fromJson(Location.class));
+					loc.setName(inLoc.getName())
+							.setAddress(inLoc.getAddress())
+							.setCity(inLoc.getCity())
+							.setProvince(inLoc.getProvince())
+							.setPostalCode(inLoc.getPostalCode())
+							.setCoordinates(inLoc.getCoordinates());
 
-			// Update Location
-			Location inLoc = ctx.parse(fromJson(Location.class));
-			loc.setName(inLoc.getName())
-					.setAddress(inLoc.getAddress())
-					.setCity(inLoc.getCity())
-					.setProvince(inLoc.getProvince())
-					.setPostalCode(inLoc.getPostalCode())
-					.setCoordinates(inLoc.getCoordinates());
+					return ctx.blocking(() -> locations.save(loc));
+				}).then(loc -> {
+					// Update distance
+					int distance = Integer.parseInt(ctx.getRequest()
+							.getQueryParams()
+							.get("distance"));
+					Point p = new Point(loc.getCoordinates()[0], loc.getCoordinates()[1]);
+					Distance d = new Distance(distance);
 
-			final Location finalLoc = loc;
-			ctx.blocking(() -> locations.save(finalLoc)).then((savedLoc) -> {
-				// Update distance
-				int distance = Integer.parseInt(ctx.getRequest()
-						.getQueryParams()
-						.get("distance"));
-				Point p = new Point(loc.getCoordinates()[0], loc.getCoordinates()[1]);
-				Distance d = new Distance(distance);
+					// Notify Predicate of the change
+					eventBus.notify(loc.getId() + ".distance", Event.wrap(Tuple.of(p, d)));
 
-				// Notify Predicate of the change
-				eventBus.notify(loc.getId() + ".distance", Event.wrap(Tuple.of(p, d)));
+					// Clear cache
+					geoNear.clearGeoNear(loc);
 
-				// Clear cache
-				geoNear.clearGeoNear(loc);
-
-				// Find nearby by querying MongoDB again
-				locations.findByCoordinatesNear(p, d)
-						.forEach(locationEventStream::broadcastNext);
-			});
-		});
+					// Find nearby by querying MongoDB again
+					locations.findByCoordinatesNear(p, d)
+							.forEach(locationEventStream::broadcastNext);
+				});
 	}
 
 	public Handler retrieveLocation() {
@@ -134,16 +129,17 @@ public class ProcessorRestApi {
 	}
 
 	public Handler retrieveNearby() {
-		return ctx -> findNearby(ctx, locations -> ctx.render(json(locations)));
+		return ctx -> findNearby(ctx)
+				.then(locations -> ctx.render(json(locations)));
 	}
 
 	private Promise<Location> findLocation(Context ctx) {
-		return ctx.blocking(() -> locations.findOne(ctx.getPathTokens().get("id")));
+		return ctx.blocking(() -> locations.findOne(ctx.getPathTokens().get("id")))
+				.onNull(() -> ctx.clientError(404));
 	}
 
-	private void findNearby(Context ctx, Action<? super Iterable<? extends Location>> action) {
-		// have to resort to a callback here due to a Ratpack bug (can't execute nested promises)
-		findLocation(ctx).then((l) -> action.execute(geoNear.findGeoNear(l)));
+	private Promise<Iterable<? extends Location>> findNearby(Context ctx) {
+		return findLocation(ctx).map(geoNear::findGeoNear);
 	}
 
 }
